@@ -1,0 +1,101 @@
+{\rtf1\ansi\ansicpg950\cocoartf2867
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww38300\viewh19200\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 (* ============================================================ *)\
+(* Original 3DS / merchant-managed FIDO model        *)\
+\
+(* ============================================================ *)\
+\
+(* ---------- Types ---------- *)\
+type pan.\
+type skey.\
+type pkey.\
+\
+(* ---------- Channel ---------- *)\
+free net: channel.\
+\
+(* ---------- Public / long-term names ---------- *)\
+free pan_leaked: pan.                 (* stolen / leaked card data is public *)\
+free sk_u: skey [private].            (* user's FIDO private key *)\
+free sk_m: skey [private].            (* merchant signing key trusted by issuer *)\
+\
+(* ---------- Cryptographic primitives ---------- *)\
+fun spk(skey): pkey.\
+\
+fun sign(bitstring, skey): bitstring.\
+reduc forall m:bitstring, sk:skey; checksign(sign(m, sk), spk(sk)) = m.\
+\
+(* ---------- Data constructors ---------- *)\
+fun login_chal(bitstring): bitstring [data].\
+fun login_payload(bitstring): bitstring [data].\
+fun merchant_authz_payload(bitstring, pan, bitstring): bitstring [data].\
+\
+(* ---------- Events ---------- *)\
+event user_fido_logged_in(bitstring).\
+event merchant_verified_login(bitstring).\
+event merchant_submitted_report(bitstring, pan, bitstring).\
+event issuer_accepts_3ds22(bitstring, pan, bitstring).\
+\
+(* ---------- Queries ---------- *)\
+(* If the merchant verifies a FIDO login, that login really came from the user. *)\
+query loginid:bitstring;\
+  inj-event(merchant_verified_login(loginid)) ==> inj-event(user_fido_logged_in(loginid)).\
+\
+(* This is the key comparison query. In original 3DS, issuer acceptance may rely  *)\
+(* only on the merchant's reported outcome. Under a malicious merchant, this       *)\
+\
+query tid:bitstring, p:pan, loginid:bitstring;\
+  inj-event(issuer_accepts_3ds22(tid, p, loginid)) ==> inj-event(user_fido_logged_in(loginid)).\
+\
+\
+(* query attacker(sk_u). *)\
+\
+(* PAN secrecy is intentionally NOT queried, because pan_leaked is public by design. *)\
+\
+(* ---------- Roles ---------- *)\
+\
+(* Honest user: responds to a merchant-generated FIDO login challenge. *)\
+let User(skU:skey) =\
+  in(net, msg1:bitstring);\
+  let login_chal(loginid) = msg1 in\
+  event user_fido_logged_in(loginid);\
+  out(net, sign(login_payload(loginid), skU)).\
+\
+(* Honest merchant-managed FIDO flow:                                     *)\
+let HonestMerchant(pkU:pkey, skM:skey, p:pan) =\
+  new loginid:bitstring;\
+  out(net, login_chal(loginid));\
+  in(net, sig:bitstring);\
+  let login_payload(=loginid) = checksign(sig, pkU) in\
+  event merchant_verified_login(loginid);\
+  new tid:bitstring;\
+  event merchant_submitted_report(tid, p, loginid);\
+  out(net, sign(merchant_authz_payload(tid, p, loginid), skM)).\
+\
+(* Malicious merchant: can directly claim that FIDO succeeded and attach   *)\
+let MaliciousMerchant(skM:skey, p:pan) =\
+  new fake_tid:bitstring;\
+  new fake_loginid:bitstring;\
+  event merchant_submitted_report(fake_tid, p, fake_loginid);\
+  out(net, sign(merchant_authz_payload(fake_tid, p, fake_loginid), skM)).\
+\
+(* Issuer / ACS in the original 3DS comparison model:                      *)\
+let IssuerOriginal3DS(pkM:pkey) =\
+  in(net, msg2:bitstring);\
+  let merchant_authz_payload(tid, p, loginid) = checksign(msg2, pkM) in\
+  event issuer_accepts_3ds22(tid, p, loginid).\
+\
+(* ---------- Main ---------- *)\
+process\
+  User(sk_u)\
+  |\
+  HonestMerchant(spk(sk_u), sk_m, pan_leaked)\
+  |\
+  MaliciousMerchant(sk_m, pan_leaked)\
+  |\
+  !IssuerOriginal3DS(spk(sk_m))\
+}

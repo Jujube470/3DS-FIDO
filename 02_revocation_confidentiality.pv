@@ -1,0 +1,383 @@
+(*
+  3DS-FIDO, aligned with IEEE_ACCESS_3DSFIDO (5).pdf, Figs. 5-9.
+  VIEW: Revocation confidentiality with initially private PAN/UID/CID
+
+  Logical-message model, NOT a byte-level WebAuthn/CTAP/EMV model.
+  Trusted logged-in account context; trusted FIDO client and local EMV
+  terminal; honest issuers/cloud/App; correct authenticated TLS abstracted
+  by fresh private channels. Origin and required UP/UV checks are assumed.
+  Public revocation payloads are deliberately released on net in BOTH views.
+  Read README.md for the exact scope, including truncation and state limits.
+
+  All normal registration/assertion/card transcripts remain private.
+  The attacker sees verification keys and both issuer-scoped revocation
+  commitments. No unlinkability or compromise-resilience claim is made.
+*)
+
+set preciseActions = true.
+
+type pan.
+type rpid.
+type masterkey.
+type seedkey.
+type mackey.
+type skey.
+type pkey.
+
+free net: channel.
+free rp1, rp2: rpid.
+free issuerSK1, issuerSK2: skey [private].
+free kw1, kw2: mackey [private].
+const ok: bitstring.
+
+(* Resolution hints for recursive counter cells, not security axioms.
+   These change proof search, not the protocol or the attacker. *)
+noselect state:channel, n:nat; mess( *state,n) [ignoreAFewTimes,inductionOn=n].
+noselect state:channel, n:nat, b:bool; mess( *state,(n,*b)) [ignoreAFewTimes,inductionOn=n].
+
+(* Public algorithms: knowing all inputs suffices to compute the result. *)
+fun spk(skey): pkey.
+fun deriveSK(masterkey, bitstring, bitstring, rpid): skey.
+fun commitment(seedkey, rpid): bitstring.
+fun hash(bitstring): bitstring.
+fun hmacUN(mackey, bitstring): bitstring.
+fun trunc32(bitstring): bitstring.
+
+fun sign(bitstring, skey): bitstring.
+reduc forall m:bitstring, sk:skey;
+  checksign(sign(m, sk), spk(sk)) = m.
+(* Signatures do not provide confidentiality. *)
+reduc forall m:bitstring, sk:skey; getmessage(sign(m, sk)) = m.
+
+(* Public, unambiguously encoded logical records, with public projections. *)
+fun registration(bitstring, bitstring, rpid, bitstring, pkey, nat, bitstring): bitstring [data].
+fun assertion(bitstring, bitstring, rpid, bitstring, nat): bitstring [data].
+fun encodeResponse(bitstring, bitstring): bitstring [data].
+fun staticCardData(pan, bitstring, bitstring): bitstring [data].
+fun dynamicCardData(bitstring, bitstring): bitstring [data].
+fun revocationPayload(rpid, bitstring): bitstring [data].
+
+event secretMaster(masterkey).
+event secretSeed(seedkey).
+event secretCredential(skey).
+event secretCardKey(skey).
+event protectedPAN(pan).
+event protectedUID(bitstring).
+event protectedCID(bitstring).
+
+event registrationStarted(bitstring, rpid, bitstring).
+event registrationCreated(pkey, bitstring, bitstring).
+event registrationAccepted(pkey, bitstring, bitstring).
+event assertionSigned(pkey, bitstring, bitstring).
+event signatureCreated(pkey, bitstring, bitstring).
+event signatureVerified(pkey, bitstring, bitstring).
+event cardResponded(pan, pkey, bitstring).
+event cardVerified(pan, pkey, bitstring).
+event bindingAccepted(pan, pkey, pkey, bitstring, bitstring, bitstring).
+event bindingActive(pan, bitstring, rpid, bitstring, bitstring).
+event transactionIssued(bitstring, pan, bitstring, rpid, bitstring, bitstring, pkey).
+event transactionAccepted(bitstring, pan, pkey, bitstring, bitstring).
+event counterChecked(bitstring, nat, nat, bitstring).
+event revocationSubmitted(rpid, bitstring).
+event revocationMatched(rpid, bitstring).
+event registrationReached.
+event bindingReached(nat).
+event transactionReached(nat).
+event twoTransactionsReached(nat, nat, nat, nat).
+event revocationReached.
+
+(* QUERIES: Revocation confidentiality with initially private PAN/UID/CID *)
+(* S01-S04: session-generated secrets, including both RP-derived keys. *)
+query x:masterkey; event(secretMaster(x)) && attacker(x) ==> false.
+query x:seedkey; event(secretSeed(x)) && attacker(x) ==> false.
+query x:skey; event(secretCredential(x)) && attacker(x) ==> false.
+query x:skey; event(secretCardKey(x)) && attacker(x) ==> false.
+(* S05-S08: honest issuer signing keys and independent UN derivation keys. *)
+query attacker(issuerSK1).
+query attacker(issuerSK2).
+query attacker(kw1).
+query attacker(kw2).
+(* P01-P03: no deduction of initially private PAN/UID/CID from public
+   revocation payloads plus public verification keys. This does not claim
+   identifiers stay secret if obtained separately from another context. *)
+query x:pan; event(protectedPAN(x)) && attacker(x) ==> false.
+query x:bitstring; event(protectedUID(x)) && attacker(x) ==> false.
+query x:bitstring; event(protectedCID(x)) && attacker(x) ==> false.
+(* R01-R05: reachability diagnostics. Expected results are FALSE for
+   "not event(...)"; an honest witness is desired, not a security failure. *)
+query event(registrationReached).
+query event(bindingReached(1)).
+query event(transactionReached(2)).
+query event(twoTransactionsReached(1,2,2,3)).
+query event(revocationReached).
+
+
+(* Authenticator: one credential at this RP; its private state channel is
+   the corresponding list_a[CID] entry. There are unbounded devices and
+   unbounded assertion requests for each credential. *)
+let Authenticator(uid:bitstring, rp:rpid, msk:masterkey, seed:seedkey,
+                  registrationRequest:channel, registrationReply:channel,
+                  assertionRequest:channel) =
+  in(registrationRequest, (=uid, challenge:bitstring, =rp));
+  new cid[]:bitstring;
+  event protectedCID(cid);
+  let sk = deriveSK(msk, cid, uid, rp) in
+  let pk = spk(sk) in
+  let cmt = commitment(seed, rp) in
+  event secretCredential(sk);
+  let m = registration(uid, challenge, rp, cid, pk, 0, cmt) in
+  let sigma = sign(m, sk) in
+  event signatureCreated(pk, m, sigma);
+  event registrationCreated(pk, m, sigma);
+  out(net, pk);
+  (* This transcript remains in the authenticated secure channel. *)
+  out(registrationReply, (m, sigma));
+  new authenticatorState[]:channel;
+  (
+    out(authenticatorState, 0)
+    |
+    !(
+      in(assertionRequest, (c:bitstring, =rp, =cid, reply:channel));
+      in(authenticatorState, previous:nat);
+      let current = previous + 1 in
+      let reconstructedSK = deriveSK(msk, cid, uid, rp) in
+      let response = assertion(uid, c, rp, cid, current) in
+      let responseSignature = sign(response, reconstructedSK) in
+      event signatureCreated(pk, response, responseSignature);
+      event assertionSigned(pk, response, responseSignature);
+      (
+        out(authenticatorState, current)
+        |
+        ((* This transcript remains in the authenticated secure channel. *)
+         out(reply, (response, responseSignature)))
+      )
+    )
+  ).
+
+(* The card receives its already-issued SSAD. It never holds issuerSK.
+   The card key and the PAN association are prevalidated by certificate
+   processing, which is abstracted rather than implemented here. *)
+let EMVCard(cardPAN:pan, cardSK:skey, ssad:bitstring, cardRequest:channel) =
+  !(
+    in(cardRequest, (un:bitstring, reply:channel));
+    new nc[]:bitstring;
+    let sdad = sign(dynamicCardData(nc, un), cardSK) in
+    event cardResponded(cardPAN, spk(cardSK), un);
+    (* Local card-reading transcript is trusted and private. *)
+    out(reply, (ssad, sdad))
+  ).
+
+(* Issuer, its RP and ACS are co-owned logical roles. A fresh reply channel
+   is secure transport/session bookkeeping, not a new signed protocol field.
+   The persistent RP state is consumed and replaced, never append-only. *)
+let IssuerRPACS(uid:bitstring, cardPAN:pan, rp:rpid, kw:mackey,
+                issuerPK:pkey, cardPK:pkey,
+                registrationRequest:channel, registrationReply:channel,
+                assertionRequest:channel, cardRequest:channel,
+                backupRecord:channel, revocationRequest:channel,
+                transactionNotice:channel) =
+  new rsReg[]:bitstring;
+  let regChallenge = hash(rsReg) in
+  event registrationStarted(uid, rp, regChallenge);
+  out(registrationRequest, (uid, regChallenge, rp));
+  in(registrationReply, (mReg:bitstring, sigReg:bitstring));
+  let registration(=uid, =regChallenge, =rp, cid:bitstring,
+                   pk:pkey, =0, cmt:bitstring) = mReg in
+  if checksign(sigReg, pk) = mReg then
+  event signatureVerified(pk, mReg, sigReg);
+  event registrationAccepted(pk, mReg, sigReg);
+  event registrationReached;
+
+  (* Binding: retain the raw FIDO response BEFORE verifying it at the RP. *)
+  new rsBind[]:bitstring;
+  let bindingChallenge = hash(rsBind) in
+  new bindingReply[]:channel;
+  out(assertionRequest, (bindingChallenge, rp, cid, bindingReply));
+  in(bindingReply, (heldMessage:bitstring, heldSignature:bitstring));
+  let mu = hash(encodeResponse(heldMessage, heldSignature)) in
+  let un = trunc32(hmacUN(kw, mu)) in
+  new cardReply[]:channel;
+  out(cardRequest, (un, cardReply));
+  in(cardReply, (ssad:bitstring, sdad:bitstring));
+  let staticCardData(=cardPAN, expiry:bitstring, aip:bitstring) =
+      checksign(ssad, issuerPK) in
+  let dynamicCardData(nc:bitstring, =un) = checksign(sdad, cardPK) in
+  event cardVerified(cardPAN, cardPK, un);
+
+  (* Only after the card checks does the RP verify the retained response. *)
+  if checksign(heldSignature, pk) = heldMessage then
+  let assertion(=uid, =bindingChallenge, =rp, =cid, bindCounter:nat) = heldMessage in
+  if bindCounter > 0 then
+  event counterChecked(cid, 0, bindCounter, heldMessage);
+  event signatureVerified(pk, heldMessage, heldSignature);
+  event bindingAccepted(cardPAN, pk, cardPK, heldMessage, heldSignature, un);
+  event bindingActive(cardPAN, uid, rp, cid, cmt);
+  event bindingReached(bindCounter);
+  (* Trusted LOCAL backup provisioning, not a proposed network protocol. *)
+  out(backupRecord, (cardPAN, rp, cmt));
+  new rpState[]:channel;
+  (
+    out(rpState, (bindCounter, true))
+    |
+    !(
+      (* Resolve an eligible PAN to the active account/credential binding. *)
+      in(rpState, (snapshotCounter:nat, snapshotActive:bool));
+      (
+      out(rpState, (snapshotCounter, snapshotActive))
+      |
+      (
+      if snapshotActive = true then
+      new tid[]:bitstring;
+      new rsTx[]:bitstring;
+      let c = hash(rsTx) in
+      event transactionIssued(tid, cardPAN, uid, rp, c, cid, pk);
+      new assertionReply[]:channel;
+      out(assertionRequest, (c, rp, cid, assertionReply));
+      in(assertionReply, (mTx:bitstring, sigTx:bitstring));
+      if checksign(sigTx, pk) = mTx then
+      let assertion(=uid, =c, =rp, =cid, current:nat) = mTx in
+      in(rpState, (previous:nat, active:bool));
+      if active = true then
+        if current > previous then
+          event counterChecked(cid, previous, current, mTx);
+          event signatureVerified(pk, mTx, sigTx);
+          event transactionAccepted(tid, cardPAN, pk, mTx, sigTx);
+          event transactionReached(current);
+          (out(rpState, (current, true)) | out(transactionNotice, (previous, current)))
+        else
+          out(rpState, (previous, active))
+      else
+        out(rpState, (previous, active))
+      )
+      )
+    )
+    |
+    (
+      (* Only the assumed authorized, honest service can use this channel.
+         Request authorization itself is NOT a verified claim. *)
+      in(revocationRequest, (=cmt, ack:channel));
+      in(rpState, (lastCounter:nat, wasActive:bool));
+      event revocationMatched(rp, cmt);
+      (out(rpState, (lastCounter, false)) | out(ack, ok))
+    )
+  ).
+
+(* Honest cloud router. The payload is visible in the clear, even though
+   authenticated transport and authorization are assumed for processing. *)
+let RevocationService(serviceRequest:channel, request1:channel, request2:channel) =
+  !(
+    in(serviceRequest, (rp:rpid, cmt:bitstring, ack:channel));
+    out(net, revocationPayload(rp, cmt));
+    if rp = rp1 then out(request1, (cmt, ack))
+    else if rp = rp2 then out(request2, (cmt, ack))
+  ).
+
+(* One selected lost authenticator is indexed locally by seed. Two different
+   issuer records demonstrate that only ONE previously-bound card is needed
+   to retrieve and submit ALL commitments for that selected device.
+   The trusted local backup/import mechanism is an explicit assumption. *)
+let RevocationApp(seed:seedkey, pan1:pan, issuerPK1:pkey, cardPK1:pkey,
+                  cardRequest1:channel, backup1:channel, backup2:channel,
+                  serviceRequest:channel) =
+  in(backup1, (=pan1, =rp1, cmt1:bitstring));
+  in(backup2, (pan2:pan, =rp2, cmt2:bitstring));
+  (* The local index association is checked, without disclosing seed. *)
+  if cmt1 = commitment(seed, rp1) then
+  if cmt2 = commitment(seed, rp2) then
+  new localCardChallenge[]:bitstring;
+  new localCardReply[]:channel;
+  out(cardRequest1, (localCardChallenge, localCardReply));
+  in(localCardReply, (ssad:bitstring, sdad:bitstring));
+  let staticCardData(=pan1, expiry:bitstring, aip:bitstring) =
+      checksign(ssad, issuerPK1) in
+  let dynamicCardData(nc:bitstring, =localCardChallenge) =
+      checksign(sdad, cardPK1) in
+  (* PAN matching is local. No PAN, UID, CID, seed or key is submitted. *)
+  new ack1[]:channel;
+  new ack2[]:channel;
+  event revocationSubmitted(rp1, cmt1);
+  out(serviceRequest, (rp1, cmt1, ack1));
+  event revocationSubmitted(rp2, cmt2);
+  out(serviceRequest, (rp2, cmt2, ack2));
+  in(ack1, =ok);
+  in(ack2, =ok);
+  event revocationReached.
+  (* Termination models no further use of this App record. It is not a
+     secure-erasure proof; the authenticator's original secrets persist. *)
+
+(* Independent local observer for a concrete two-transaction witness.
+   It neither controls nor authorizes revocation or transaction processing. *)
+let TransactionWitness(notice:channel) =
+  in(notice, (old1:nat, current1:nat));
+  in(notice, (old2:nat, current2:nat));
+  if current2 > current1 then
+  event twoTransactionsReached(old1,current1,old2,current2).
+
+let CredentialInstance(uid:bitstring, cardPAN:pan, rp:rpid,
+                       msk:masterkey, seed:seedkey, kw:mackey,
+                       issuerPK:pkey, cardPK:pkey, cardRequest:channel,
+                       backup:channel, revRequest:channel, notice:channel) =
+  new registrationRequest[]:channel;
+  new registrationReply[]:channel;
+  new assertionRequest[]:channel;
+  (
+    Authenticator(uid, rp, msk, seed, registrationRequest, registrationReply, assertionRequest)
+    |
+    IssuerRPACS(uid, cardPAN, rp, kw, issuerPK, cardPK,
+                registrationRequest, registrationReply, assertionRequest,
+                cardRequest, backup, revRequest, notice)
+  ).
+
+(* Unbounded independent devices. Each device has two RP-scoped credentials
+   sharing its factory msk and seed, and arbitrarily many transactions.
+   An account UID is sampled once and reused for its credential's lifetime. *)
+let Device =
+  new msk[]:masterkey;
+  new seed[]:seedkey;
+  new uid1[]:bitstring;
+  new uid2[]:bitstring;
+  new pan1[]:pan;
+  new pan2[]:pan;
+  new cardSK1[]:skey;
+  new cardSK2[]:skey;
+  event secretMaster(msk);
+  event secretSeed(seed);
+  event protectedUID(uid1);
+  event protectedUID(uid2);
+  event protectedPAN(pan1);
+  event protectedPAN(pan2);
+  event secretCardKey(cardSK1);
+  event secretCardKey(cardSK2);
+  (* PAN and UID remain in the trusted context. *)
+  out(net, (spk(cardSK1), spk(cardSK2)));
+  new expiry1[]:bitstring;
+  new expiry2[]:bitstring;
+  new aip1[]:bitstring;
+  new aip2[]:bitstring;
+  let ssad1 = sign(staticCardData(pan1, expiry1, aip1), issuerSK1) in
+  let ssad2 = sign(staticCardData(pan2, expiry2, aip2), issuerSK2) in
+  new cardRequest1[]:channel;
+  new cardRequest2[]:channel;
+  new backup1[]:channel;
+  new backup2[]:channel;
+  new revRequest1[]:channel;
+  new revRequest2[]:channel;
+  new notice1[]:channel;
+  new notice2[]:channel;
+  new serviceRequest[]:channel;
+  (
+    EMVCard(pan1, cardSK1, ssad1, cardRequest1)
+    | EMVCard(pan2, cardSK2, ssad2, cardRequest2)
+    | CredentialInstance(uid1, pan1, rp1, msk, seed, kw1,
+        spk(issuerSK1), spk(cardSK1), cardRequest1, backup1, revRequest1, notice1)
+    | CredentialInstance(uid2, pan2, rp2, msk, seed, kw2,
+        spk(issuerSK2), spk(cardSK2), cardRequest2, backup2, revRequest2, notice2)
+    | RevocationService(serviceRequest, revRequest1, revRequest2)
+    | TransactionWitness(notice1)
+    | RevocationApp(seed, pan1, spk(issuerSK1), spk(cardSK1),
+        cardRequest1, backup1, backup2, serviceRequest)
+  ).
+
+process
+  out(net, (spk(issuerSK1), spk(issuerSK2)));
+  !Device

@@ -1,6 +1,6 @@
 # 3DS-FIDO: ProVerif Models Including Revocation Confidentiality
 
-These models follow Sections III, IV, and V-B and Figures 5–9 of **IEEE_ACCESS_3DSFIDO (5).pdf**. Both `.pv` files include registration, card binding, transactions, and revocation, and each can be executed independently. The manuscript itself has not been modified.
+These models follow Sections III, IV, and V-B and Figures 5–9 of **3DSFIDO**. Both `.pv` files include registration, card binding, transactions, and revocation, and each can be executed independently. The manuscript itself has not been modified.
 
 ## 1. Why Two Models?
 
